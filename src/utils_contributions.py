@@ -307,7 +307,6 @@ def compute_joint_attention(att_mat):
         
     return joint_attentions
 
-from extract_explanations import tokens2words
 
 def compute_alti(layer_alti_data):
     resultant_norm = torch.norm(torch.squeeze(layer_alti_data['attn_res_outputs']),p=1,dim=-1)
@@ -316,6 +315,7 @@ def compute_alti(layer_alti_data):
     return contributions_mix_alti
 
 def normalize_contributions_for_visualization(explanations_list, tokenized_text, mean=False, max=False, min=0, word_level_contribs=True, add_pred=True, bos=False):
+    from extract_explanations import tokens2words
     normalized_explanations = []
     for explanation in explanations_list:
 
