@@ -14,3 +14,4 @@ seaborn==0.12.2
 textacy==0.11.0
 datasets==4.4.1
 torchaudio
+torchcodec

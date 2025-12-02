@@ -101,4 +101,9 @@ If you use this work, please consider citing:
       archivePrefix={arXiv},
       primaryClass={cs.CL}
 }
-````
+```
+
+## development notes
+- adapt for whisper decoder
+- experiment setup
+- adapt for encoder

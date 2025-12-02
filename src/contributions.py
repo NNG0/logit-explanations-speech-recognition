@@ -10,17 +10,15 @@ config = parse_config("./src/config.yaml")
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 def get_module(model, module_name, model_layer_name, layer=None):
-    parsed_module_name = module_name.split('.')
     tmp_module = model
+    # Loop to find layers module
+    for sub_module in module_layer_name.split('.'):
+        tmp_module = getattr(tmp_module, sub_module)
+    # Select specific layer
     if layer != None:
-        parsed_layer_name = model_layer_name.split('.')
-        # Loop to find layers module
-        for sub_module in parsed_layer_name:
-            tmp_module = getattr(tmp_module, sub_module)
-        # Select specific layer
         tmp_module = tmp_module[layer]
     # Loop over layer module to find module_name
-    for sub_module in parsed_module_name:
+    for sub_module in module_name.split('.'):
         tmp_module = getattr(tmp_module, sub_module)
 
     return tmp_module
@@ -35,9 +33,11 @@ class ModelWrapper(nn.Module):
         self.attention_head_size = int(self.model.config.hidden_size / self.model.config.num_attention_heads)
         self.all_head_size = self.num_attention_heads * self.attention_head_size
         # Get number of layers in model
-        try:
+        if self.model.config.model_type == "whisper":
+            self.num_layers = len(self.model.config.decoder_layers)
+        elif hasattr(self.model.config, "n_layers"):
             self.num_layers = self.model.config.n_layers
-        except:
+        else:
             self.num_layers = self.model.config.num_hidden_layers
 
     def save_activation(self,name, mod, inp, out):
@@ -100,6 +100,10 @@ class ModelWrapper(nn.Module):
             w_v = w_v.view(-1,self.num_attention_heads,self.attention_head_size)
             # b_v -> num_heads, dim_head
             b_v = values_module.bias.view(self.num_attention_heads, 3, self.attention_head_size)[:,2,:]
+        elif self.model.config.model_type == "whisper":
+            w_v = values_module.weight.transpose(0,1)
+            w_v = w_v.view(-1,self.num_attention_heads, self.attention_head_size)
+            b_v = values_module.bias.view(self.num_attention_heads, self.attention_head_size)
         else:
             w_v = values_module.weight.transpose(0,1)
             w_v = w_v.view(-1,self.num_attention_heads,self.attention_head_size)
@@ -114,6 +118,11 @@ class ModelWrapper(nn.Module):
             W^l_o in shape: [dim, num_heads, dim_head]
             b^l_o in shape: [dim]
         '''
+        if self.model.config.model_type == "whisper":
+            dense = out_proj_module.weight
+            w_o = dense.view(self.all_head_size, self.num_attention_heads, self.attention_head_size)
+            b_o = out_proj_module.bias
+            return w_o, b_o
         if self.model.config.model_type == 'gpt2':
             dense = out_proj_module.weight.transpose(0,1)
         else:
