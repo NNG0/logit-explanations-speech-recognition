@@ -39,6 +39,8 @@ models:
     values: 'self_attn.v_proj'
     dense: 'self_attn.out_proj'
     lnf: 'model.model.decoder.final_layer_norm'
+    enc_values: 'encoder_attn.vproj'
+    enc_out: 'encoder_attn.out_proj'
     fc1: 'fc1'
     fc2: 'fc1'
     unembed: 'proj_out'

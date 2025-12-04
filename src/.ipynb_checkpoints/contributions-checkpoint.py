@@ -65,21 +65,12 @@ class ModelWrapper(nn.Module):
         ln2 = get_module(self.model, self.modules_config['ln2'], model_layer_name, layer)
         values = get_module(self.model, self.modules_config['values'], model_layer_name, layer)
 
-        enc_values = None
-        enc_out = None
-
-        if 'enc_values' in self.modules_config:
-            enc_values = get_module(self.model, self.modules_config['enc_values'], model_layer_name, layer)
-            enc_out = get_module(self.model, self.modules_config['enc_out'], model_layer_name, layer)
-
         return {'dense': dense,
                 'fc1': fc1,
                 'fc2': fc2,
                 'ln1': ln1,
                 'ln2': ln2,
-                'values': values,
-                'enc_values': enc_values,
-                'enc_out': enc_out
+                'values': values
                 }
     
     def get_values_weights(self, values_module):
@@ -193,38 +184,9 @@ class ModelWrapper(nn.Module):
         else:
             # If no lnf, return initial tensor as is
             return tensor_input
-
-    def compute_cross_T(
-        self,
-        enc_tokens,             # [src_len, dim]
-        a_cross,                # [num_heads, tgt_len, src_len]
-        enc_values_mod,         # HF module: encoder_attn.v_proj
-        enc_out_mod,            # HF module: encoder_attn.out_proj
-        pre_lnf_states,
-        lnf
-    ):
-        # Extract encoder-attention weights
-        w_v_enc, b_v_enc = self.get_values_weights(enc_values_mod)
-        w_o_enc, b_o_enc = self.get_out_proj_weights(enc_out_mod)
-
-        # Value-projection of encoder tokens
-        # v_enc_heads: [num_heads, src_len, head_dim]
-        v_enc_heads = torch.einsum('sd,dhz->hsz', enc_tokens, w_v_enc).squeeze()
-
-        # Apply out projection: [num_heads, src_len, dim]
-        lin_enc_w_o_heads = torch.einsum('hsz,dhz->hsd', v_enc_heads, w_o_enc)
-
-        # Apply cross-attention weights:
-        # lin_enc_x_i_heads: [num_heads, tgt_len, src_len, dim]
-        lin_enc_x_i_heads = torch.einsum('hsd,hts->htsd', lin_enc_w_o_heads, a_cross)
-
-        # Apply final layer norm of the decoder layer (same as self-attn path)
-        l_lin_enc_x_i_heads = self.run_final_ln(lin_enc_x_i_heads, pre_lnf_states, lnf)
-
-        return l_lin_enc_x_i_heads
-        
+    
     @torch.no_grad()
-    def get_logit_contributions(self, hidden_states, attentions, token, full_vocab=False, output_pos=-1, encoder_hidden_states=None, cross_attentions=None):
+    def get_logit_contributions(self, hidden_states, attentions, token, full_vocab=False, output_pos=-1):
         '''Obtains the ∆logit to token by each Transformer component.
             Args:
                 hidden_states_model (list[torch.tensor]): intermediate token representations at each layer (inputs to self-attention). [batch, seq_length, all_head_size]
@@ -294,56 +256,6 @@ class ModelWrapper(nn.Module):
                     lnf_bias = lnf.bias.detach()
                     lnf_bias_logit = torch.einsum('vd,d->v', embed_matrix, lnf_bias)
                     logits_modules['lnf_bias'] = lnf_bias_logit
-
-
-            # cross-attention modules for this layer
-            enc_values_mod = modules_dict.get('enc_values',None)
-            enc_out_mod = modules_dict.get('enc_out', None)
-
-            if (enc_values_mod is not None
-                and enc_out_mod is not None
-                and encoder_hidden_states is not None
-                and cross_attentions is not None):
-
-                # final encoder outputs:
-                if isinstance(encoder_hidden_states, (list, tuple)):
-                    encoder_final = encoder_hidden_states[-1].detach()
-                else:
-                    encoder_final = encoder_hidden_states.detach()
-
-                # collapse batch dimension
-                enc_tokens = encoder_final.squeeze(0)        # [src_len, dim]
-
-                # attention for this layer: [heads, tgt_len, src_len]
-                a_cross = cross_attentions[layer][0]
-
-                # run helper → gives [heads, tgt_len, src_len, dim]
-                T_cross = self.compute_cross_T(
-                    enc_tokens,
-                    a_cross,
-                    enc_values_mod,
-                    enc_out_mod,
-                    pre_lnf_states,
-                    lnf
-                )
-
-                # For this output position, reduce to [heads, src_len, dim]
-                T_cross_pos = T_cross[:, output_pos, :, :]   # [heads, src_len, dim]
-
-                # Project into logits: [heads, src_len, vocab]
-                logits_cross_heads = torch.einsum("hsd,vd->hsv", T_cross_pos, embed_matrix)
-
-
-                # Sum over heads → [src_len, vocab]
-                if full_vocab:
-                    logits_cross = logits_cross_heads.sum(0)
-                else:
-                    logits_cross = torch.einsum("hsd,d->hs", T_cross_pos, embed_matrix.squeeze(0))
-
-                if "enc_lin_logits_layers" not in logits_modules:
-                    logits_modules["enc_lin_logits_layers"] = []
-
-                logits_modules["enc_lin_logits_layers"].append(logits_cross)
 
             # ∆logit^l MLP
             fc2_out = func_outputs[model_layer_name + '.' + str(layer) + '.' + self.modules_config['fc2']][0].squeeze()
@@ -480,15 +392,7 @@ class ModelWrapper(nn.Module):
             prediction_scores = output['logits'].detach()
             hidden_states = output['hidden_states']
             attentions = output['attentions']
-
-            cross_attentions = None
-            encoder_hidden_states = None
-
-            if 'cross_attentions' in output:
-                cross_attentions = output['cross_attentions']
-            if 'encoder_hidden_states' in output:
-                encoder_hidden_states = output['encoder_hidden_states']
-
+            
             # Clean forward_hooks dictionaries
             self.clean_hooks()
-            return prediction_scores, hidden_states, attentions, encoder_hidden_states, cross_attentions
+            return prediction_scores, hidden_states, attentions
