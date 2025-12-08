@@ -88,37 +88,10 @@ class ModelWrapper(nn.Module):
             W^l_v in shape: [dim, num_heads, dim_head]
             b^l_v in shape: [num_heads, dim_head]
         '''
-
-        if self.model.config.model_type == 'gpt2':
-            w_v = values_module.weight[:,-self.all_head_size:]
-            w_v = w_v.view(-1,self.num_attention_heads,self.attention_head_size)
-            # b^l_v -> num_heads, dim_head
-            b_v = values_module.bias[-self.all_head_size:].view(self.num_attention_heads,-1)
-
-        elif self.model.config.model_type == 'opt':
-            w_v = values_module.weight.transpose(0,1)
-            w_v = w_v.view(-1,self.num_attention_heads,self.attention_head_size)
-            # b^l_v -> num_heads, dim_head
-            b_v = values_module.bias[-self.all_head_size:].view(self.num_attention_heads,-1)
-        elif self.model.config.model_type == 'bloom':
-            # BLOOM has a weird way of computing the values
-            # https://github.com/huggingface/transformers/blob/cf11493dce0a1d22446efe0d6c4ade02fd928e50/src/transformers/models/bloom/modeling_bloom.py#LL238C9-L238C21
-            w_v_big = values_module.weight.transpose(0,1)
-            split_w_v_big = w_v_big.view(-1, self.num_attention_heads, 3, self.attention_head_size)
-            w_v = split_w_v_big[:,:,2,:].reshape(self.all_head_size,self.all_head_size)
-            w_v = w_v.view(-1,self.num_attention_heads,self.attention_head_size)
-            # b_v -> num_heads, dim_head
-            b_v = values_module.bias.view(self.num_attention_heads, 3, self.attention_head_size)[:,2,:]
-        elif self.model.config.model_type == "whisper":
-            w_v = values_module.weight.transpose(0,1)
-            w_v = w_v.view(-1,self.num_attention_heads, self.attention_head_size)
-            b_v = values_module.bias.view(self.num_attention_heads, self.attention_head_size)
-        else:
-            w_v = values_module.weight.transpose(0,1)
-            w_v = w_v.view(-1,self.num_attention_heads,self.attention_head_size)
-            # b^l_v -> num_heads, dim_head
-            b_v = values_module.bias[-self.all_head_size:].view(self.num_attention_heads,-1)
-            
+        w_v = values_module.weight.transpose(0,1)
+        w_v = w_v.view(-1,self.num_attention_heads, self.attention_head_size)
+        b_v = values_module.bias.view(self.num_attention_heads, self.attention_head_size)
+           
         return w_v, b_v
     
     def get_out_proj_weights(self, out_proj_module):
@@ -127,19 +100,9 @@ class ModelWrapper(nn.Module):
             W^l_o in shape: [dim, num_heads, dim_head]
             b^l_o in shape: [dim]
         '''
-        if self.model.config.model_type == "whisper":
-            dense = out_proj_module.weight
-            w_o = dense.view(self.all_head_size, self.num_attention_heads, self.attention_head_size)
-            b_o = out_proj_module.bias
-            return w_o, b_o
-        if self.model.config.model_type == 'gpt2':
-            dense = out_proj_module.weight.transpose(0,1)
-        else:
-            dense = out_proj_module.weight
-        
+        dense = out_proj_module.weight
         w_o = dense.view(self.all_head_size, self.num_attention_heads, self.attention_head_size)
-        b_o = out_proj_module.bias.detach()
-
+        b_o = out_proj_module.bias
         return w_o, b_o
 
     def l_transform(self, x, w_ln, ln_eps, pre_ln_states):
@@ -306,8 +269,7 @@ class ModelWrapper(nn.Module):
                     logits_modules['lnf_bias'] = lnf_bias_logit
 
 
-            # cross-attention modules for this layer
-            enc_values_mod = modules_dict.get('enc_values',None)
+            # cross-attention modules for this layer enc_values_mod = modules_dict.get('enc_values',None)
             enc_out_mod = modules_dict.get('enc_out', None)
 
             if (enc_values_mod is not None
