@@ -64,13 +64,8 @@ class ModelWrapper(nn.Module):
         ln1 = get_module(self.model, self.modules_config['ln1'], model_layer_name, layer)
         ln2 = get_module(self.model, self.modules_config['ln2'], model_layer_name, layer)
         values = get_module(self.model, self.modules_config['values'], model_layer_name, layer)
-
-        enc_values = None
-        enc_out = None
-
-        if 'enc_values' in self.modules_config:
-            enc_values = get_module(self.model, self.modules_config['enc_values'], model_layer_name, layer)
-            enc_out = get_module(self.model, self.modules_config['enc_out'], model_layer_name, layer)
+        enc_values = get_module(self.model, self.modules_config['enc_values'], model_layer_name, layer)
+        enc_out = get_module(self.model, self.modules_config['enc_out'], model_layer_name, layer)
 
         return {'dense': dense,
                 'fc1': fc1,

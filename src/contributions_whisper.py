@@ -1,4 +1,7 @@
 import torch
+from torch import Tensor
+from torchtyping import TensorType
+from typing import Tuple
 import torch.nn.functional as F
 from functools import partial
 import collections
@@ -65,12 +68,8 @@ class ModelWrapper(nn.Module):
         ln2 = get_module(self.model, self.modules_config['ln2'], model_layer_name, layer)
         values = get_module(self.model, self.modules_config['values'], model_layer_name, layer)
 
-        enc_values = None
-        enc_out = None
-
-        if 'enc_values' in self.modules_config:
-            enc_values = get_module(self.model, self.modules_config['enc_values'], model_layer_name, layer)
-            enc_out = get_module(self.model, self.modules_config['enc_out'], model_layer_name, layer)
+        enc_values = get_module(self.model, self.modules_config['enc_values'], model_layer_name, layer)
+        enc_out = get_module(self.model, self.modules_config['enc_out'], model_layer_name, layer)
 
         return {'dense': dense,
                 'fc1': fc1,
@@ -165,7 +164,10 @@ class ModelWrapper(nn.Module):
         enc_out_mod,            # HF module: encoder_attn.out_proj
         pre_lnf_states,
         lnf
-    ):
+    ) -> Tuple[
+        TensorType["tgt_len", "dim"],
+        TensorType["num_heads", "tgt_len","dim"],
+    ]:
         # Extract encoder-attention weights
         w_v_enc, b_v_enc = self.get_values_weights(enc_values_mod)
         w_o_enc, b_o_enc = self.get_out_proj_weights(enc_out_mod)
@@ -175,26 +177,19 @@ class ModelWrapper(nn.Module):
         v_enc_heads = torch.einsum('sd,dhz->hsz', enc_tokens, w_v_enc).squeeze()
 
         # Apply out projection: [num_heads, src_len, dim]
-        lin_enc_w_o_heads = torch.einsum('hsz,dhz->hsd', v_enc_heads, w_o_enc)
+        o_enc = torch.einsum('hsz,dhz->hsd', v_enc_heads, w_o_enc) + b_o_enc
 
         # Apply cross-attention weights:
         # lin_enc_x_i_heads: [num_heads, tgt_len, src_len, dim]
-        lin_enc_x_i_heads = torch.einsum('hsd,hts->htsd', lin_enc_w_o_heads, a_cross)
+        cross_attn_heads = torch.einsum('hsd,hts->htsd', o_enc, a_cross)
+
+        # sum over src tokens
+        T_cross_heads = cross_attn_heads.sum(2)
+        T_cross = T_cross_heads.sum(0)
 
         # Apply final layer norm of the decoder layer (same as self-attn path)
-        l_lin_enc_x_i_heads = self.run_final_ln(lin_enc_x_i_heads, pre_lnf_states, lnf)
-
-        out = []
-        for t in range(lin_enc_x_i_heads.size(1)):
-            ln_out = self.run_final_ln(
-                lin_enc_x_i_heads[:, t, :, :],   # [heads, src, dim]
-                pre_lnf_states[t],               # [dim]
-                lnf
-            )
-            out.append(ln_out.unsqueeze(1))
-
-        l_lin_enc_x_i_heads = torch.cat(out, dim=1)
-        return l_lin_enc_x_i_heads
+        ln_T_cross = self.run_final_ln(T_cross, pre_lnf_states, lnf)
+        return ln_T_cross, T_cross_heads
         
     @torch.no_grad()
     def get_logit_contributions(self, hidden_states, attentions, token, full_vocab=False, output_pos=-1, encoder_hidden_states=None, cross_attentions=None):
@@ -209,6 +204,7 @@ class ModelWrapper(nn.Module):
         logits_modules = {}
         logits_modules['mlp_logit_layers'] = []
         logits_modules['b_o_logits_layers'] = []
+        logits_modules["enc_lin_logits_layers"] = []
 
         # Cached activations of every layer in the model after the forward-pass
         func_outputs = self.func_outputs
@@ -242,10 +238,11 @@ class ModelWrapper(nn.Module):
         # If full_vocab is used, the entire unembedding matrix is used
         embed = get_module(self.model, self.modules_config['unembed'], model_layer_name)
         embed_matrix = embed.weight.detach()
-        if full_vocab == False:
-            embed_matrix = embed_matrix[token]
-        else:
+
+        if full_vocab:
             embed_matrix = embed_matrix
+        else:
+            embed_matrix = embed_matrix[token]
             
         for layer in range(0,self.num_layers):
             hidden_states_layer = hidden_states[layer].detach()
@@ -268,54 +265,42 @@ class ModelWrapper(nn.Module):
                     lnf_bias_logit = torch.einsum('vd,d->v', embed_matrix, lnf_bias)
                     logits_modules['lnf_bias'] = lnf_bias_logit
 
+            # START OF CROSS-ATTN BLOCK 
+            # cross-attention modules for this layer 
+            enc_values_mod = modules_dict.get('enc_values')
+            enc_out_mod = modules_dict.get('enc_out')
 
-            # cross-attention modules for this layer enc_values_mod = modules_dict.get('enc_values',None)
-            enc_out_mod = modules_dict.get('enc_out', None)
+            # final encoder outputs:
+            if isinstance(encoder_hidden_states, (list, tuple)):
+                encoder_final = encoder_hidden_states[-1].detach()
+            else:
+                encoder_final = encoder_hidden_states.detach()
 
-            if (enc_values_mod is not None
-                and enc_out_mod is not None
-                and encoder_hidden_states is not None
-                and cross_attentions is not None):
+            # collapse batch dimension
+            enc_tokens = encoder_final.squeeze(0)        # [src_len, dim]
 
-                # final encoder outputs:
-                if isinstance(encoder_hidden_states, (list, tuple)):
-                    encoder_final = encoder_hidden_states[-1].detach()
-                else:
-                    encoder_final = encoder_hidden_states.detach()
+            # attention for this layer: [heads, tgt_len, src_len]
+            a_cross = cross_attentions[layer][0]
 
-                # collapse batch dimension
-                enc_tokens = encoder_final.squeeze(0)        # [src_len, dim]
+            # gives [tgt_len, src_len, dim]
+            ln_T_cross, _ = self.compute_cross_T(
+                enc_tokens,
+                a_cross,
+                enc_values_mod,
+                enc_out_mod,
+                pre_lnf_states,
+                lnf
+            )
 
-                # attention for this layer: [heads, tgt_len, src_len]
-                a_cross = cross_attentions[layer][0]
+            # For this output position, reduce to [heads, src_len, dim]
+            ln_Tp = ln_T_cross[output_pos]   # [src_len, dim]
 
-                # run helper → gives [heads, tgt_len, src_len, dim]
-                T_cross = self.compute_cross_T(
-                    enc_tokens,
-                    a_cross,
-                    enc_values_mod,
-                    enc_out_mod,
-                    pre_lnf_states,
-                    lnf
-                )
+            # Sum over heads → [src_len, vocab]
+            logits_cross = torch.einsum("vd,d->v", ln_Tp, embed_matrix)
 
-                # For this output position, reduce to [heads, src_len, dim]
-                T_cross_pos = T_cross[:, output_pos, :, :]   # [heads, src_len, dim]
+            logits_modules["enc_lin_logits_layers"].append(logits_cross)
 
-                # Project into logits: [heads, src_len, vocab]
-                logits_cross_heads = torch.einsum("hsd,vd->hsv", T_cross_pos, embed_matrix)
-
-
-                # Sum over heads → [src_len, vocab]
-                if full_vocab:
-                    logits_cross = logits_cross_heads.sum(0)
-                else:
-                    logits_cross = torch.einsum("hsd,d->hs", T_cross_pos, embed_matrix.squeeze(0))
-
-                if "enc_lin_logits_layers" not in logits_modules:
-                    logits_modules["enc_lin_logits_layers"] = []
-
-                logits_modules["enc_lin_logits_layers"].append(logits_cross)
+            # END OF CROSS-ATTN BLOCK
 
             # ∆logit^l MLP
             fc2_out = func_outputs[model_layer_name + '.' + str(layer) + '.' + self.modules_config['fc2']][0].squeeze()
@@ -452,14 +437,8 @@ class ModelWrapper(nn.Module):
             prediction_scores = output['logits'].detach()
             hidden_states = output['hidden_states']
             attentions = output['attentions']
-
-            cross_attentions = None
-            encoder_hidden_states = None
-
-            if 'cross_attentions' in output:
-                cross_attentions = output['cross_attentions']
-            if 'encoder_hidden_states' in output:
-                encoder_hidden_states = output['encoder_hidden_states']
+            cross_attentions = output['cross_attentions']
+            encoder_hidden_states = output['encoder_hidden_states']
 
             # Clean forward_hooks dictionaries
             self.clean_hooks()
