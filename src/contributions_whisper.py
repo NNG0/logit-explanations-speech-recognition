@@ -165,8 +165,9 @@ class ModelWrapper(nn.Module):
         pre_lnf_states,
         lnf
     ) -> Tuple[
-        TensorType["tgt_len", "dim"],
-        TensorType["num_heads", "tgt_len","dim"],
+        TensorType["tgt_len", "src_len", "dim"],
+        TensorType["num_heads", "tgt_len","src_len","dim"],
+        Tensor
     ]:
         # Extract encoder-attention weights
         w_v_enc, b_v_enc = self.get_values_weights(enc_values_mod)
@@ -174,22 +175,20 @@ class ModelWrapper(nn.Module):
 
         # Value-projection of encoder tokens
         # v_enc_heads: [num_heads, src_len, head_dim]
-        v_enc_heads = torch.einsum('sd,dhz->hsz', enc_tokens, w_v_enc).squeeze()
+        v_enc_heads = torch.einsum('sd,dhz->hsz', enc_tokens, w_v_enc)
 
         # Apply out projection: [num_heads, src_len, dim]
-        o_enc = torch.einsum('hsz,dhz->hsd', v_enc_heads, w_o_enc) + b_o_enc
+        o_enc = torch.einsum('hsz,dhz->hsd', v_enc_heads, w_o_enc) 
 
         # Apply cross-attention weights:
         # lin_enc_x_i_heads: [num_heads, tgt_len, src_len, dim]
         cross_attn_heads = torch.einsum('hsd,hts->htsd', o_enc, a_cross)
 
-        # sum over src tokens
-        T_cross_heads = cross_attn_heads.sum(2)
-        T_cross = T_cross_heads.sum(0)
+        T_cross = cross_attn_heads.sum(0)
 
-        # Apply final layer norm of the decoder layer (same as self-attn path)
+        # Apply final layer norm of the decoder layer
         ln_T_cross = self.run_final_ln(T_cross, pre_lnf_states, lnf)
-        return ln_T_cross, T_cross_heads
+        return ln_T_cross, cross_attn_heads, b_o_enc
         
     @torch.no_grad()
     def get_logit_contributions(self, hidden_states, attentions, token, full_vocab=False, output_pos=-1, encoder_hidden_states=None, cross_attentions=None):
@@ -282,8 +281,7 @@ class ModelWrapper(nn.Module):
             # attention for this layer: [heads, tgt_len, src_len]
             a_cross = cross_attentions[layer][0]
 
-            # gives [tgt_len, src_len, dim]
-            ln_T_cross, _ = self.compute_cross_T(
+            ln_T_cross, cross_attn_heads, out_proj_bias = self.compute_cross_T(
                 enc_tokens,
                 a_cross,
                 enc_values_mod,
@@ -296,9 +294,15 @@ class ModelWrapper(nn.Module):
             ln_Tp = ln_T_cross[output_pos]   # [src_len, dim]
 
             # Sum over heads → [src_len, vocab]
-            logits_cross = torch.einsum("vd,d->v", ln_Tp, embed_matrix)
+            logits_cross = torch.einsum("sd,vd->sv", ln_Tp, embed_matrix)
 
-            logits_modules["enc_lin_logits_layers"].append(logits_cross)
+            # bias contribution
+            ln_b_o_pos = self.run_final_ln(out_proj_bias, pre_lnf_states[output_pos], lnf)
+            bias_logits = torch.einsum('vd,d->v', embed_matrix, ln_b_o_pos)
+
+            logits_cross_total = logits_cross.sum(0) + bias_logits
+
+            logits_modules["enc_lin_logits_layers"].append(logits_cross_total)
 
             # END OF CROSS-ATTN BLOCK
 
