@@ -37,7 +37,7 @@ class ModelWrapper(nn.Module):
         self.all_head_size = self.num_attention_heads * self.attention_head_size
         # Get number of layers in model
         if self.model.config.model_type == "whisper":
-            self.num_layers = len(self.model.config.decoder_layers)
+            self.num_layers = self.model.config.decoder_layers
         elif hasattr(self.model.config, "n_layers"):
             self.num_layers = self.model.config.n_layers
         else:
@@ -163,6 +163,8 @@ class ModelWrapper(nn.Module):
         enc_values_mod,         # HF module: encoder_attn.v_proj
         enc_out_mod,            # HF module: encoder_attn.out_proj
         pre_lnf_states,
+        unembed,
+        output_pos,
         lnf
     ) -> Tuple[
         TensorType["tgt_len", "src_len", "dim"],
@@ -186,9 +188,37 @@ class ModelWrapper(nn.Module):
 
         T_cross = cross_attn_heads.sum(0)
 
-        # Apply final layer norm of the decoder layer
-        ln_T_cross = self.run_final_ln(T_cross, pre_lnf_states, lnf)
-        return ln_T_cross, cross_attn_heads, b_o_enc
+        # Apply final layer norm of the decoder layer (same as self-attn path)
+        l_lin_enc_x_i_heads = self.run_final_ln(lin_enc_x_i_heads, pre_lnf_states, lnf)
+
+        out = []
+        for t in range(lin_enc_x_i_heads.size(1)):
+            ln_out = self.run_final_ln(
+                lin_enc_x_i_heads[:, t, :, :],   # [heads, src, dim]
+                pre_lnf_states[t],               # [dim]
+                lnf
+            )
+            out.append(ln_out.unsqueeze(1))
+
+
+        l_lin_enc_x_i_heads = torch.cat(out, dim=1)
+
+        # For this output position, reduce to [heads, src_len, dim]
+        T_cross_pos = l_lin_enc_x_i_heads[:, output_pos, :, :]   # [heads, src_len, dim]
+
+        # Project into logits: [heads, src_len, vocab]
+        logits_cross_heads = torch.einsum("hsd,vd->hsv", T_cross_pos, unembed)
+
+
+        # Sum over heads → [src_len, vocab]
+        if full_vocab:
+            logits_cross = logits_cross_heads.sum(0)
+        else:
+            logits_cross = torch.einsum("hsd,d->hs", T_cross_pos, unembed.squeeze(0))
+
+
+
+        return logits_cross
         
     @torch.no_grad()
     def get_logit_contributions(self, hidden_states, attentions, token, full_vocab=False, output_pos=-1, encoder_hidden_states=None, cross_attentions=None):
@@ -281,30 +311,17 @@ class ModelWrapper(nn.Module):
             # attention for this layer: [heads, tgt_len, src_len]
             a_cross = cross_attentions[layer][0]
 
-            ln_T_cross, cross_attn_heads, out_proj_bias = self.compute_cross_T(
-                enc_tokens,
-                a_cross,
-                enc_values_mod,
-                enc_out_mod,
-                pre_lnf_states,
-                lnf
-            )
+                # run helper → gives [heads, tgt_len, src_len, dim]
+                logits_cross = self.compute_cross_T(
+                    enc_tokens,
+                    a_cross,
+                    enc_values_mod,
+                    enc_out_mod,
+                    pre_lnf_states,
+                    lnf
+                )
 
-            # For this output position, reduce to [heads, src_len, dim]
-            ln_Tp = ln_T_cross[output_pos]   # [src_len, dim]
-
-            # Sum over heads → [src_len, vocab]
-            logits_cross = torch.einsum("sd,vd->sv", ln_Tp, embed_matrix)
-
-            # bias contribution
-            ln_b_o_pos = self.run_final_ln(out_proj_bias, pre_lnf_states[output_pos], lnf)
-            bias_logits = torch.einsum('vd,d->v', embed_matrix, ln_b_o_pos)
-
-            logits_cross_total = logits_cross.sum(0) + bias_logits
-
-            logits_modules["enc_lin_logits_layers"].append(logits_cross_total)
-
-            # END OF CROSS-ATTN BLOCK
+                logits_modules["enc_lin_logits_layers"].append(logits_cross)
 
             # ∆logit^l MLP
             fc2_out = func_outputs[model_layer_name + '.' + str(layer) + '.' + self.modules_config['fc2']][0].squeeze()

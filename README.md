@@ -68,5 +68,9 @@ Code inspiered by the paper [Explaining How Transformers Use Context to Build Pr
 ```
 
 ## development notes
-- add documentation
+- [x] adapt for whisper decoder
 - experiment setup
+- adapt for encoder
+- document changes for methods part
+- look at evaluation
+- 
