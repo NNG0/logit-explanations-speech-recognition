@@ -311,17 +311,17 @@ class ModelWrapper(nn.Module):
             # attention for this layer: [heads, tgt_len, src_len]
             a_cross = cross_attentions[layer][0]
 
-                # run helper → gives [heads, tgt_len, src_len, dim]
-                logits_cross = self.compute_cross_T(
-                    enc_tokens,
-                    a_cross,
-                    enc_values_mod,
-                    enc_out_mod,
-                    pre_lnf_states,
-                    lnf
-                )
+            # run helper → gives [heads, tgt_len, src_len, dim]
+            logits_cross = self.compute_cross_T(
+                enc_tokens,
+                a_cross,
+                enc_values_mod,
+                enc_out_mod,
+                pre_lnf_states,
+                lnf
+            )
 
-                logits_modules["enc_lin_logits_layers"].append(logits_cross)
+            logits_modules["enc_lin_logits_layers"].append(logits_cross)
 
             # ∆logit^l MLP
             fc2_out = func_outputs[model_layer_name + '.' + str(layer) + '.' + self.modules_config['fc2']][0].squeeze()
