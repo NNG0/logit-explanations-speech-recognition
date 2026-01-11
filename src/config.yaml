@@ -1,14 +1,14 @@
 models:
   whisper:
-    layer: 'model.model.decoder.layers'
+    layer: 'model.decoder.layers'
     ln1: 'self_attn_layer_norm'
     ln2: 'final_layer_norm'
     values: 'self_attn.v_proj'
     dense: 'self_attn.out_proj'
-    lnf: 'model.model.decoder.final_layer_norm'
     enc_values: 'encoder_attn.v_proj'
     enc_out: 'encoder_attn.out_proj'
     fc1: 'fc1'
     fc2: 'fc2'
+    lnf: 'model.decoder.layer_norm'
     unembed: 'proj_out'
     pre_layer_norm: 'True'

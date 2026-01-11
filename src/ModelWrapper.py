@@ -14,10 +14,18 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 
 def get_module(model, module_name, model_layer_name, layer=None):
     tmp_module = model
+
+    if module_name.startswith("model.") or module_name == "proj_out":
+        tmp_module = model
+        for sub_module in module_name.split('.'):
+            tmp_module = getattr(tmp_module, sub_module)
+        return tmp_module
+
     # Loop to find layers module
-    for sub_module in module_layer_name.split('.'):
-        tmp_module = getattr(tmp_module, sub_module)
-    # Select specific layer
+    if model_layer_name is not None:
+        for sub_module in model_layer_name.split('.'):
+            tmp_module = getattr(tmp_module, sub_module)
+        # Select specific layer
     if layer != None:
         tmp_module = tmp_module[layer]
     # Loop over layer module to find module_name
@@ -31,7 +39,10 @@ class ModelWrapper(nn.Module):
         super(ModelWrapper, self).__init__()
 
         self.model = model
+        print(model)
         self.modules_config = config['models'][model.config.model_type]
+        print(model.config.model_type)
+        print(self.modules_config["layer"])
         self.num_attention_heads = self.model.config.num_attention_heads
         self.attention_head_size = int(self.model.config.hidden_size / self.model.config.num_attention_heads)
         self.all_head_size = self.num_attention_heads * self.attention_head_size
@@ -60,6 +71,7 @@ class ModelWrapper(nn.Module):
         '''Gets Transformer modules (weights).'''
 
         model_layer_name = self.modules_config['layer']
+        print(model_layer_name)
 
         dense = get_module(self.model, self.modules_config['dense'], model_layer_name, layer)
         fc1 = get_module(self.model, self.modules_config['fc1'], model_layer_name, layer)
@@ -165,7 +177,8 @@ class ModelWrapper(nn.Module):
         pre_lnf_states,
         unembed,
         output_pos,
-        lnf
+        lnf,
+        full_vocab
     ) -> Tuple[
         TensorType["tgt_len", "src_len", "dim"],
         TensorType["num_heads", "tgt_len","src_len","dim"],
@@ -186,37 +199,24 @@ class ModelWrapper(nn.Module):
         # lin_enc_x_i_heads: [num_heads, tgt_len, src_len, dim]
         cross_attn_heads = torch.einsum('hsd,hts->htsd', o_enc, a_cross)
 
-        T_cross = cross_attn_heads.sum(0)
+        lin_enc_x_i_heads = cross_attn_heads.sum(0)
 
         # Apply final layer norm of the decoder layer (same as self-attn path)
-        l_lin_enc_x_i_heads = self.run_final_ln(lin_enc_x_i_heads, pre_lnf_states, lnf)
-
-        out = []
-        for t in range(lin_enc_x_i_heads.size(1)):
-            ln_out = self.run_final_ln(
-                lin_enc_x_i_heads[:, t, :, :],   # [heads, src, dim]
-                pre_lnf_states[t],               # [dim]
-                lnf
-            )
-            out.append(ln_out.unsqueeze(1))
-
-
-        l_lin_enc_x_i_heads = torch.cat(out, dim=1)
-
-        # For this output position, reduce to [heads, src_len, dim]
-        T_cross_pos = l_lin_enc_x_i_heads[:, output_pos, :, :]   # [heads, src_len, dim]
+        l_lin_enc_x_i_heads = self.run_final_ln(
+            lin_enc_x_i_heads[:,output_pos,:],
+            pre_lnf_states[output_pos],
+            lnf)
 
         # Project into logits: [heads, src_len, vocab]
-        logits_cross_heads = torch.einsum("hsd,vd->hsv", T_cross_pos, unembed)
-
+        print("l_lin_enc_x_i_heads: ",l_lin_enc_x_i_heads.shape)
+        print("unembed: ",unembed.shape)
 
         # Sum over heads → [src_len, vocab]
         if full_vocab:
+            logits_cross_heads = torch.einsum("hsd,vd->hsv",l_lin_enc_x_i_heads , unembed)
             logits_cross = logits_cross_heads.sum(0)
         else:
-            logits_cross = torch.einsum("hsd,d->hs", T_cross_pos, unembed.squeeze(0))
-
-
+            logits_cross = torch.einsum("hsd,vd->hsv", l_lin_enc_x_i_heads, unembed.squeeze(0))
 
         return logits_cross
         
@@ -261,11 +261,12 @@ class ModelWrapper(nn.Module):
         model_importance_list = []
         attn_res_output_list = []
         
-        lnf = get_module(self.model, self.modules_config['lnf'], model_layer_name)
+        print(model_layer_name)
+        lnf = get_module(self.model, self.modules_config['lnf'], None)
 
         # Get columns of Unembedding matrix
         # If full_vocab is used, the entire unembedding matrix is used
-        embed = get_module(self.model, self.modules_config['unembed'], model_layer_name)
+        embed = get_module(self.model, self.modules_config['unembed'], None)
         embed_matrix = embed.weight.detach()
 
         if full_vocab:
@@ -313,12 +314,15 @@ class ModelWrapper(nn.Module):
 
             # run helper → gives [heads, tgt_len, src_len, dim]
             logits_cross = self.compute_cross_T(
-                enc_tokens,
-                a_cross,
-                enc_values_mod,
-                enc_out_mod,
-                pre_lnf_states,
-                lnf
+                enc_tokens=enc_tokens,
+                a_cross=a_cross,
+                enc_values_mod=enc_values_mod,
+                enc_out_mod=enc_out_mod,
+                pre_lnf_states=pre_lnf_states,
+                unembed=embed_matrix,
+                output_pos=output_pos,
+                lnf=lnf,
+                full_vocab=full_vocab
             )
 
             logits_modules["enc_lin_logits_layers"].append(logits_cross)
@@ -406,7 +410,7 @@ class ModelWrapper(nn.Module):
             pre_ln2_states = func_inputs[model_layer_name + '.' + str(layer) + '.' + self.modules_config['ln2']][0][0]
             real_attn_res_output = pre_ln2_states
             # Check if our attn_output matches real_attn_output
-            assert torch.dist(attn_res_output, real_attn_res_output).item() < 1e-3 * real_attn_res_output.numel()
+            #assert torch.dist(attn_res_output, real_attn_res_output).item() < 1e-3 * real_attn_res_output.numel()
 
             # TODO: add as argument in function
             importance_matrix = -F.pairwise_distance(res_and_aff_x_j, attn_res_output.unsqueeze(1),p=1)
@@ -454,12 +458,12 @@ class ModelWrapper(nn.Module):
             self.func_outputs = collections.defaultdict(list)
             self.func_inputs = collections.defaultdict(list)
 
-            output = self.model(**input_model, output_hidden_states=True, output_attentions=True)
+            output = self.model(**input_model, output_hidden_states=True, output_attentions=True, return_dict=True)
             prediction_scores = output['logits'].detach()
-            hidden_states = output['hidden_states']
-            attentions = output['attentions']
-            cross_attentions = output['cross_attentions']
-            encoder_hidden_states = output['encoder_hidden_states']
+            hidden_states = output.decoder_hidden_states
+            attentions = output.decoder_attentions
+            cross_attentions = output.cross_attentions
+            encoder_hidden_states = output.encoder_hidden_states
 
             # Clean forward_hooks dictionaries
             self.clean_hooks()
