@@ -220,7 +220,7 @@ class ModelWrapper(nn.Module):
         else:
             logits_cross = torch.einsum("hsd,vd->hsv", l_lin_enc_x_i_heads, unembed.squeeze(0))
 
-        return logits_cross, frame_contrib
+        return logits_cross, frame_contrib, l_lin_enc_x_i_heads
         
     @torch.no_grad()
     def get_logit_contributions(self, hidden_states, attentions, token, full_vocab=False, output_pos=-1, encoder_hidden_states=None, cross_attentions=None):
@@ -237,6 +237,7 @@ class ModelWrapper(nn.Module):
         logits_modules['b_o_logits_layers'] = []
         logits_modules["enc_lin_logits_layers"] = []
         logits_modules["frame_contributions"] = []
+        logits_modules["l_lin_enc_x_i_heads"] = []
 
         # Cached activations of every layer in the model after the forward-pass
         func_outputs = self.func_outputs
@@ -316,7 +317,7 @@ class ModelWrapper(nn.Module):
             a_cross = cross_attentions[layer][0]
 
             # run helper → gives [heads, tgt_len, src_len, dim]
-            logits_cross, frame_contrib = self.compute_cross_T(
+            logits_cross, frame_contrib, l_lin_enc_x_i_heads = self.compute_cross_T(
                 enc_tokens=enc_tokens,
                 a_cross=a_cross,
                 enc_values_mod=enc_values_mod,
@@ -330,6 +331,7 @@ class ModelWrapper(nn.Module):
 
             logits_modules["enc_lin_logits_layers"].append(logits_cross)
             logits_modules["frame_contributions"].append(frame_contrib)
+            logits_modules["l_lin_enc_x_i_heads"].append(l_lin_enc_x_i_heads)
 
             # ∆logit^l MLP
             fc2_out = func_outputs[model_layer_name + '.' + str(layer) + '.' + self.modules_config['fc2']][0].squeeze()
